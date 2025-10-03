@@ -11,8 +11,7 @@ use embassy_rp::pio::{Common, Config as PioConf, ShiftConfig, ShiftDirection, St
 use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, Instance, InterruptHandler};
 use embassy_rp::{bind_interrupts, pio};
-use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
-use embassy_sync::pipe::Pipe;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
@@ -26,7 +25,8 @@ pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 use panic_halt as _;
 
-static SIGNAL: Signal<ThreadModeRawMutex, u32> = Signal::new();
+static SIGNAL: Signal<ThreadModeRawMutex, ()> = Signal::new();
+static INPUT: Signal<ThreadModeRawMutex, u8> = Signal::new();
 static ECHO: Signal<ThreadModeRawMutex, u8> = Signal::new();
 
 bind_interrupts!(struct Irqs {
@@ -62,8 +62,8 @@ fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, 
 
 async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
     loop {
-        let value = sm.rx().wait_pull().await;
-        SIGNAL.signal(value);
+        let _ = sm.rx().wait_pull().await;
+        SIGNAL.signal(());
     }
 }
 
@@ -131,32 +131,18 @@ async fn main(_spawner: Spawner) {
 
     setup_pio_task_sm0(&mut common, &mut sm0);
 
-    // Pipe setup
-    let mut usb_pipe: Pipe<NoopRawMutex, 20> = Pipe::new();
-    let (mut usb_pipe_reader, mut usb_pipe_writer) = usb_pipe.split();
-
-    let mut uart_pipe: Pipe<NoopRawMutex, 20> = Pipe::new();
-    let (mut uart_pipe_reader, mut uart_pipe_writer) = uart_pipe.split();
-
     let (mut usb_tx, mut usb_rx) = class.split();
 
     // Read + write from USB
     let usb_future = async {
         loop {
             usb_rx.wait_connection().await;
-            let _ = join(
-                usb_read(&mut usb_rx, &mut uart_pipe_writer),
-                usb_write(&mut usb_tx, &mut usb_pipe_reader),
-            )
-            .await;
+            let _ = join(usb_read(&mut usb_rx), usb_write(&mut usb_tx)).await;
         }
     };
 
     // Read + write from UART
-    let uart_future = join(
-        uart_read(&mut uart_rx, &mut usb_pipe_writer),
-        uart_write(&mut uart_tx, &mut uart_pipe_reader),
-    );
+    let uart_future = uart_write(&mut uart_tx);
 
     // Run everything concurrently.
     join4(usb_fut, usb_future, uart_future, pio_task_sm0(sm0)).await;
@@ -173,66 +159,33 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-/// Read from the USB and write it to the UART TX pipe
 async fn usb_read<'d, T: Instance + 'd>(
     usb_rx: &mut Receiver<'d, Driver<'d, T>>,
-    uart_pipe_writer: &mut embassy_sync::pipe::Writer<'_, NoopRawMutex, 20>,
 ) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
+    let mut buf = [0; 1];
     loop {
-        let n = usb_rx.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-        (*uart_pipe_writer).write(data).await;
+        let _n = usb_rx.read_packet(&mut buf).await?;
+        let byte = buf[0];
+        INPUT.signal(byte);
     }
 }
 
-/// Read from the USB TX pipe and write it to the USB
-async fn usb_write<'d, T: Instance + 'd>(
-    usb_tx: &mut Sender<'d, Driver<'d, T>>,
-    usb_pipe_reader: &mut embassy_sync::pipe::Reader<'_, NoopRawMutex, 20>,
+async fn usb_write<'d, t: Instance + 'd>(
+    usb_tx: &mut Sender<'d, Driver<'d, t>>,
 ) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
-    loop {
-        let n = (*usb_pipe_reader).read(&mut buf).await;
-        let data = &buf[..n];
-        usb_tx.write_packet(&data).await?;
-    }
-}
-
-/// Read from the UART and write it to the USB TX pipe
-async fn uart_read<PIO: pio::Instance, const SM: usize>(
-    _uart_rx: &mut PioUartRx<'_, PIO, SM>,
-    usb_pipe_writer: &mut embassy_sync::pipe::Writer<'_, NoopRawMutex, 20>,
-) -> ! {
-    // let mut buf = [0; 1];
-    // loop {
-    //     let n = uart_rx.read(&mut buf).await.expect("UART read error");
-    //     if n == 0 {
-    //         continue;
-    //     }
-    //     let data = &buf[..n];
-    //     (*usb_pipe_writer).write(data).await;
-    // }
-
     loop {
         let byte = ECHO.wait().await;
-        (*usb_pipe_writer).write(&[byte]).await;
+        usb_tx.write_packet(&[byte]).await?;
     }
 }
 
-/// Read from the UART TX pipe and write it to the UART
 async fn uart_write<PIO: pio::Instance, const SM: usize>(
     uart_tx: &mut PioUartTx<'_, PIO, SM>,
-    uart_pipe_reader: &mut embassy_sync::pipe::Reader<'_, NoopRawMutex, 20>,
 ) -> ! {
-    let mut buf = [0; 64];
     loop {
-        let n = (*uart_pipe_reader).read(&mut buf).await;
-        let data = &buf[..n];
-        for byte in data {
-            let _ = uart_tx.write(&[*byte]).await;
-            SIGNAL.wait().await;
-            ECHO.signal(*byte);
-        }
+        let byte = INPUT.wait().await;
+        let _ = uart_tx.write(&[byte]).await;
+        let _ = SIGNAL.wait().await;
+        ECHO.signal(byte);
     }
 }
