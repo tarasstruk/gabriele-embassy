@@ -16,5 +16,8 @@ cargo run -- --tty /dev/tty.usbmodem123456781 --text welcome.txt
 sudo apt-get install -y  libudev-dev
 cargo install elf2uf2-rs
 
+
+rustup target add thumbv6m-none-eabi
+
 ```
 
