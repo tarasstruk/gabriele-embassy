@@ -37,13 +37,16 @@ bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
 });
 
-fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, PIO1, 0>, input_pin: Peri<'d, impl PioPin + 'd>) {
+fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, 
+    sm: &mut StateMachine<'d, PIO1, 0>, 
+    input_pin: Peri<'d, impl PioPin + 'd>,
+    debug_pin: Peri<'d, impl PioPin + 'd>,
+    ) {
     let prg = pio_asm!(
         ".wrap_target"
-        "  wait 0 pin 0"
-        "  wait 1 pin 0"
+        "  set pins 0"
         "ready:"
-        "  wait 0 pin 3"
+        "  wait 1 pin 0"
         "  wait 1 pin 3"
         "  nop [31]"
         "  jmp pin ready"
@@ -60,7 +63,10 @@ fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, 
     };
 
     let feedback_pin = pio.make_pio_pin(input_pin);
+    let d_pin = pio.make_pio_pin(debug_pin);
+
     cfg.set_jmp_pin(&feedback_pin);
+    cfg.set_set_pins(&[&d_pin]);
 
     let divider = calculate_pio_clock_divider(2000);
 
@@ -68,6 +74,7 @@ fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, 
     
     cfg.clock_divider = divider;
     sm.set_config(&cfg);
+    sm.set_pin_dirs(pio::Direction::Out, &[&d_pin]);
     sm.set_enable(true);
 }
 
@@ -141,7 +148,7 @@ async fn main(_spawner: Spawner) {
     } = pio::Pio::new(p.PIO1, Irqs);
 
 
-    setup_pio_task_sm0(&mut common, &mut sm0, p.PIN_3);
+    setup_pio_task_sm0(&mut common, &mut sm0, p.PIN_3, p.PIN_5);
 
     let (mut usb_tx, mut usb_rx) = class.split();
 
