@@ -2,6 +2,8 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
+use defmt::*;
+use {defmt_rtt as _, panic_probe as _};
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join4};
 use embassy_rp::peripherals::{PIO0, PIO1, USB};
@@ -19,11 +21,16 @@ use embassy_usb::{Builder, Config};
 use embedded_io_async::Write;
 use fixed::types::extra::U8;
 
-#[unsafe(link_section = ".boot_loader")]
-#[used]
-pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
+// #[unsafe(link_section = ".boot_loader")]
+// #[used]
+// pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
-use panic_halt as _;
+// use panic_halt as _;
+
+#[defmt::panic_handler]
+fn panic() -> ! {
+    panic_probe::hard_fault();
+}
 
 static SIGNAL: Signal<ThreadModeRawMutex, ()> = Signal::new();
 static INPUT: Signal<ThreadModeRawMutex, u8> = Signal::new();
@@ -69,6 +76,7 @@ async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
+    info!("spawner started");
     let p = embassy_rp::init(Default::default());
 
     // Create the driver, from the HAL.
@@ -153,7 +161,7 @@ struct Disconnected {}
 impl From<EndpointError> for Disconnected {
     fn from(val: EndpointError) -> Self {
         match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
+            EndpointError::BufferOverflow => panic(),
             EndpointError::Disabled => Disconnected {},
         }
     }
@@ -164,6 +172,7 @@ async fn usb_read<'d, T: Instance + 'd>(
 ) -> Result<(), Disconnected> {
     let mut buf = [0; 1];
     loop {
+        info!("byte read");
         let _n = usb_rx.read_packet(&mut buf).await?;
         let byte = buf[0];
         INPUT.signal(byte);
@@ -183,8 +192,9 @@ async fn uart_write<PIO: pio::Instance, const SM: usize>(
     uart_tx: &mut PioUartTx<'_, PIO, SM>,
 ) -> ! {
     loop {
+        info!("byte forward");
         let byte = INPUT.wait().await;
-        let _ = uart_tx.write(&[byte]).await;
+        // let _ = uart_tx.write(&[byte]).await;
         let _ = SIGNAL.wait().await;
         ECHO.signal(byte);
     }
