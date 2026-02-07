@@ -13,7 +13,6 @@ embassy-futures = "0.1.2"
 embassy-rp = { version = "0.9.0", features = ["defmt", "time-driver", "critical-section-impl", "rp2040"] }
 embassy-sync = { version = "0.7.2", features = ["defmt"]}
 embassy-usb = { version = "0.5.1", features = ["defmt"]}
-embedded-io-async = { version = "0.7.0", features = ["defmt"] }
 fixed = "1.29.0"
 critical-section = "1.1"
 # panic-halt = "1.0.0"

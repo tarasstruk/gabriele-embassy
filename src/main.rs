@@ -3,14 +3,14 @@
 #![allow(async_fn_in_trait)]
 
 use defmt::*;
-use {defmt_rtt as _, panic_probe as _};
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join4};
 use embassy_rp::peripherals::{PIO0, PIO1, USB};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{Common, Config as PioConf, ShiftConfig, ShiftDirection, StateMachine};
+use {defmt_rtt as _, panic_probe as _};
 
-use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
+use embassy_rp::pio_programs::uart::{PioUartTx, PioUartTxProgram};
 use embassy_rp::usb::{Driver, Instance, InterruptHandler};
 use embassy_rp::{bind_interrupts, pio};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
@@ -18,7 +18,6 @@ use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
-use embedded_io_async::Write;
 use fixed::types::extra::U8;
 
 // #[unsafe(link_section = ".boot_loader")]
@@ -67,6 +66,7 @@ fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, 
     sm.set_enable(true);
 }
 
+// signals when the "confirmation pulse" from typewriter is received
 async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
     loop {
         let _ = sm.rx().wait_pull().await;
@@ -114,21 +114,19 @@ async fn main(_spawner: Spawner) {
     let mut usb = builder.build();
 
     // Run the USB device.
-    let usb_fut = usb.run();
+    let usb_runner = usb.run();
 
     // PIO UART setup
     let pio::Pio {
-        mut common,
-        sm0,
-        sm1,
-        ..
+        mut common, sm0, ..
     } = pio::Pio::new(p.PIO0, Irqs);
 
     let tx_program = PioUartTxProgram::new(&mut common);
     let mut uart_tx = PioUartTx::new(4800, &mut common, sm0, p.PIN_0, &tx_program);
 
-    let rx_program = PioUartRxProgram::new(&mut common);
-    let mut uart_rx = PioUartRx::new(4800, &mut common, sm1, p.PIN_1, &rx_program);
+    // TODO
+    // let rx_program = PioUartRxProgram::new(&mut common);
+    // let mut uart_rx = PioUartRx::new(4800, &mut common, sm1, p.PIN_1, &rx_program);
 
     let pio::Pio {
         mut common,
@@ -153,7 +151,7 @@ async fn main(_spawner: Spawner) {
     let uart_future = uart_write(&mut uart_tx);
 
     // Run everything concurrently.
-    join4(usb_fut, usb_future, uart_future, pio_task_sm0(sm0)).await;
+    join4(usb_runner, usb_future, uart_future, pio_task_sm0(sm0)).await;
 }
 
 struct Disconnected {}
@@ -179,8 +177,10 @@ async fn usb_read<'d, T: Instance + 'd>(
     }
 }
 
-async fn usb_write<'d, t: Instance + 'd>(
-    usb_tx: &mut Sender<'d, Driver<'d, t>>,
+// wait for a feedback from typewriter from ECHO
+// and write the received byte to USB port
+async fn usb_write<'d, T: Instance + 'd>(
+    usb_tx: &mut Sender<'d, Driver<'d, T>>,
 ) -> Result<(), Disconnected> {
     loop {
         let byte = ECHO.wait().await;
@@ -192,10 +192,10 @@ async fn uart_write<PIO: pio::Instance, const SM: usize>(
     uart_tx: &mut PioUartTx<'_, PIO, SM>,
 ) -> ! {
     loop {
-        info!("byte forward");
         let byte = INPUT.wait().await;
-        // let _ = uart_tx.write(&[byte]).await;
+        let _ = uart_tx.write_u8(byte).await;
         let _ = SIGNAL.wait().await;
         ECHO.signal(byte);
+        info!("byte forwarded");
     }
 }
