@@ -5,14 +5,14 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join4};
-use embassy_rp::peripherals::{PIO0, PIO1, USB};
+use embassy_rp::peripherals::{PIO1, USB};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{Common, Config as PioConf, ShiftConfig, ShiftDirection, StateMachine};
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_rp::pio_programs::uart::{PioUartTx, PioUartTxProgram};
+use embassy_rp::uart::{Async, UartTx};
 use embassy_rp::usb::{Driver, Instance, InterruptHandler};
-use embassy_rp::{bind_interrupts, pio};
+use embassy_rp::{bind_interrupts, pio, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
@@ -37,7 +37,6 @@ static ECHO: Signal<ThreadModeRawMutex, u8> = Signal::new();
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
-    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
     PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
 });
 
@@ -77,7 +76,7 @@ async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     info!("spawner started");
-    let p = embassy_rp::init(Default::default());
+    let p = embassy_rp::init(embassy_rp::config::Config::default());
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, Irqs);
@@ -116,22 +115,15 @@ async fn main(_spawner: Spawner) {
     // Run the USB device.
     let usb_runner = usb.run();
 
-    // PIO UART setup
-    let pio::Pio {
-        mut common, sm0, ..
-    } = pio::Pio::new(p.PIO0, Irqs);
+    // Create UART writer
+    let mut uart_config = uart::Config::default();
+    uart_config.baudrate = 4800;
+    let mut uart_tx: UartTx<'_, Async> = UartTx::new(p.UART0, p.PIN_0, p.DMA_CH1, uart_config);
 
-    let tx_program = PioUartTxProgram::new(&mut common);
-    let mut uart_tx = PioUartTx::new(4800, &mut common, sm0, p.PIN_0, &tx_program);
-
-    // TODO
-    // let rx_program = PioUartRxProgram::new(&mut common);
-    // let mut uart_rx = PioUartRx::new(4800, &mut common, sm1, p.PIN_1, &rx_program);
-
+    // PIO machinery
     let pio::Pio {
         mut common,
         mut sm0,
-        // sm1,
         ..
     } = pio::Pio::new(p.PIO1, Irqs);
 
@@ -147,11 +139,13 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    // Read + write from UART
-    let uart_future = uart_write(&mut uart_tx);
+    // UART writer worker
+    let uart_future = uart_writer_task(&mut uart_tx);
+
+    let pio_task_future = pio_task_sm0(sm0);
 
     // Run everything concurrently.
-    join4(usb_runner, usb_future, uart_future, pio_task_sm0(sm0)).await;
+    join4(usb_runner, usb_future, uart_future, pio_task_future).await;
 }
 
 struct Disconnected {}
@@ -188,14 +182,24 @@ async fn usb_write<'d, T: Instance + 'd>(
     }
 }
 
-async fn uart_write<PIO: pio::Instance, const SM: usize>(
-    uart_tx: &mut PioUartTx<'_, PIO, SM>,
-) -> ! {
+// async fn uart_write<PIO: pio::Instance, const SM: usize>(
+//     uart_tx: &mut PioUartTx<'_, PIO, SM>,
+// ) -> ! {
+//     loop {
+//         let byte = INPUT.wait().await;
+//         let _ = uart_tx.write_u8(byte).await;
+//         let _ = SIGNAL.wait().await;
+//         ECHO.signal(byte);
+//         info!("byte forwarded");
+//     }
+// }
+
+async fn uart_writer_task<'d>(uart_tx: &mut UartTx<'d, Async>) -> ! {
     loop {
         let byte = INPUT.wait().await;
-        let _ = uart_tx.write_u8(byte).await;
+        let _ = uart_tx.write(&[byte]).await;
         let _ = SIGNAL.wait().await;
         ECHO.signal(byte);
-        info!("byte forwarded");
+        info!("byte is forwarded");
     }
 }
