@@ -47,8 +47,8 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, PIO1, 0>) {
     let prg = pio_asm!(
         ".wrap_target"
-        "  wait 0 pin 0"
-        "  wait 1 pin 0"
+        "  wait 0 pin 4"
+        "  wait 1 pin 4"
         "  wait 0 pin 3"
         "  wait 1 pin 3"
         "  wait 0 pin 3"
@@ -93,7 +93,7 @@ async fn main(spawner: Spawner) {
     // Create UART writer
     let mut uart_config = uart::Config::default();
     uart_config.baudrate = 4800;
-    let uart_tx: UartTx<'_, Async> = UartTx::new(p.UART0, p.PIN_0, p.DMA_CH1, uart_config);
+    let uart_tx: UartTx<'_, Async> = UartTx::new(p.UART1, p.PIN_4, p.DMA_CH1, uart_config);
 
     // PIO machinery
     let Pio {
@@ -193,6 +193,11 @@ async fn main(spawner: Spawner) {
 
         info!("Received connection from {:?}", socket.remote_endpoint());
         control.gpio_set(0, true).await;
+
+        // reset signals
+        SIGNAL.reset();
+        INPUT.reset();
+        ECHO.reset();
 
         loop {
             let _n = match socket.read(&mut buf).await {
