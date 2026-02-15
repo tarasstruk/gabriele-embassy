@@ -182,7 +182,7 @@ async fn main(spawner: Spawner) {
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(5)));
+        socket.set_timeout(Some(Duration::from_secs(120)));
 
         control.gpio_set(0, false).await;
         info!("Listening on TCP:1234...");
@@ -207,13 +207,15 @@ async fn main(spawner: Spawner) {
                 }
             };
 
-            // info!("Received: {}", from_utf8(&buf[..n]).unwrap());
+            info!("recv: {:02x}", buf[0]);
 
             // push the received byte it into INPUT
             INPUT.signal(buf[0]);
 
             // wait for ECHO
             let echo = ECHO.wait().await;
+
+            info!("echo: {:02x}", echo);
 
             match socket.write_all(&[echo]).await {
                 Ok(()) => {
