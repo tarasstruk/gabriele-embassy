@@ -5,13 +5,18 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::{join, join4};
-use embassy_rp::peripherals::{PIO1, USB};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1, USB};
 use embassy_rp::pio::program::pio_asm;
-use embassy_rp::pio::{Common, Config as PioConf, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::pio::{Common, Config as PioConf, Pio, ShiftConfig, ShiftDirection, StateMachine};
 use {defmt_rtt as _, panic_probe as _};
 
+use cyw43::JoinOptions;
+use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
+use embassy_net::StackResources;
+use embassy_rp::clocks::RoscRng;
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::uart::{Async, UartTx};
-use embassy_rp::usb::{Driver, Instance, InterruptHandler};
+use embassy_rp::usb::{Driver, Instance};
 use embassy_rp::{bind_interrupts, pio, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
@@ -19,6 +24,7 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config};
 use fixed::types::extra::U8;
+use static_cell::StaticCell;
 
 // #[unsafe(link_section = ".boot_loader")]
 // #[used]
@@ -36,9 +42,15 @@ static INPUT: Signal<ThreadModeRawMutex, u8> = Signal::new();
 static ECHO: Signal<ThreadModeRawMutex, u8> = Signal::new();
 
 bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
-    PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
+    USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
+    runner.run().await
+}
 
 fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, PIO1, 0>) {
     let prg = pio_asm!(
@@ -73,8 +85,15 @@ async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
     }
 }
 
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
+) -> ! {
+    runner.run().await
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     info!("spawner started");
     let p = embassy_rp::init(embassy_rp::config::Config::default());
 
@@ -143,6 +162,72 @@ async fn main(_spawner: Spawner) {
     let uart_future = uart_writer_task(&mut uart_tx);
 
     let pio_task_future = pio_task_sm0(sm0);
+
+    // WiFi
+
+    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    // let nvram = include_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH0,
+    );
+
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+
+    // let _ = spawner.spawn(unwrap!(cyw43_task(runner)));
+
+    let _ = spawner.spawn(cyw43_task(runner));
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    // Generate random seed
+    let mut rng = RoscRng;
+    let seed = rng.next_u64();
+
+    // Init network stack
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
+    let _ = spawner.spawn(net_task(runner));
+
+    let wifi_net: &str = str::from_utf8(include_bytes!("../wifi_net")).unwrap();
+    let wifi_pass = include_bytes!("../wifi_pass");
+
+    while let Err(_err) = control.join(wifi_net, JoinOptions::new(wifi_pass)).await {
+        info!("join wifi network failed");
+    }
+
+    info!("waiting for link...");
+    stack.wait_link_up().await;
+
+    info!("waiting for DHCP...");
+    stack.wait_config_up().await;
+
+    // And now we can use it!
+    info!("Stack is up!");
 
     // Run everything concurrently.
     join4(usb_runner, usb_future, uart_future, pio_task_future).await;
