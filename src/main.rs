@@ -2,6 +2,7 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
+use core::str::from_utf8;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
@@ -12,12 +13,15 @@ use {defmt_rtt as _, panic_probe as _};
 use cyw43::JoinOptions;
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_net::StackResources;
+use embassy_net::tcp::TcpSocket;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::uart::{Async, UartTx};
 use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::Duration;
+use embedded_io_async::Write;
 use fixed::types::extra::U8;
 use static_cell::StaticCell;
 
@@ -177,6 +181,49 @@ async fn main(spawner: Spawner) {
 
     // Start UART
     let _ = spawner.spawn(uart_tx_task(uart_tx));
+
+    let mut rx_buffer = [0; 1];
+    let mut tx_buffer = [0; 1];
+    let mut buf = [0; 1];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(5)));
+
+        control.gpio_set(0, false).await;
+        info!("Listening on TCP:1234...");
+        if let Err(e) = socket.accept(1234).await {
+            warn!("accept error: {:?}", e);
+            continue;
+        }
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+        control.gpio_set(0, true).await;
+
+        loop {
+            let n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    warn!("read EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("read error: {:?}", e);
+                    break;
+                }
+            };
+
+            info!("Received: {}", from_utf8(&buf[..n]).unwrap());
+
+            match socket.write_all(&buf[..n]).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("write error: {:?}", e);
+                    break;
+                }
+            };
+        }
+    }
 }
 
 // async fn usb_read<'d, T: Instance + 'd>(
