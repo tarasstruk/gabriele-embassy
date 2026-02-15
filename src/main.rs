@@ -2,7 +2,7 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use core::str::from_utf8;
+// use core::str::from_utf8;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
@@ -24,12 +24,6 @@ use embassy_time::Duration;
 use embedded_io_async::Write;
 use fixed::types::extra::U8;
 use static_cell::StaticCell;
-
-// #[unsafe(link_section = ".boot_loader")]
-// #[used]
-// pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-// use panic_halt as _;
 
 #[defmt::panic_handler]
 fn panic() -> ! {
@@ -201,7 +195,7 @@ async fn main(spawner: Spawner) {
         control.gpio_set(0, true).await;
 
         loop {
-            let n = match socket.read(&mut buf).await {
+            let _n = match socket.read(&mut buf).await {
                 Ok(0) => {
                     warn!("read EOF");
                     break;
@@ -213,10 +207,18 @@ async fn main(spawner: Spawner) {
                 }
             };
 
-            info!("Received: {}", from_utf8(&buf[..n]).unwrap());
+            // info!("Received: {}", from_utf8(&buf[..n]).unwrap());
 
-            match socket.write_all(&buf[..n]).await {
-                Ok(()) => {}
+            // push the received byte it into INPUT
+            INPUT.signal(buf[0]);
+
+            // wait for ECHO
+            let echo = ECHO.wait().await;
+
+            match socket.write_all(&[echo]).await {
+                Ok(()) => {
+                    // can accept a new byte from input
+                }
                 Err(e) => {
                     warn!("write error: {:?}", e);
                     break;
@@ -226,35 +228,17 @@ async fn main(spawner: Spawner) {
     }
 }
 
-// async fn usb_read<'d, T: Instance + 'd>(
-//     usb_rx: &mut Receiver<'d, Driver<'d, T>>,
-// ) -> Result<(), Disconnected> {
-//     let mut buf = [0; 1];
-//     loop {
-//         info!("byte read");
-//         let _n = usb_rx.read_packet(&mut buf).await?;
-//         let byte = buf[0];
-//         INPUT.signal(byte);
-//     }
-// }
-
-// wait for a feedback from typewriter from ECHO
-// and write the received byte to USB port
-// async fn usb_write<'d, T: Instance + 'd>(
-//     usb_tx: &mut Sender<'d, Driver<'d, T>>,
-// ) -> Result<(), Disconnected> {
-//     loop {
-//         let byte = ECHO.wait().await;
-//         usb_tx.write_packet(&[byte]).await?;
-//     }
-// }
-
 #[embassy_executor::task]
 async fn uart_tx_task(tx: UartTx<'static, Async>) -> ! {
     let uart_future = uart_writer_task(tx);
     uart_future.await;
 }
 
+// these steps are done:
+// - receive a byte from INPUT
+// - transmit the byte to UART
+// - wait for SIGNAL
+// - produce ECHO
 async fn uart_writer_task<'d>(mut uart_tx: UartTx<'d, Async>) -> ! {
     loop {
         let byte = INPUT.wait().await;
