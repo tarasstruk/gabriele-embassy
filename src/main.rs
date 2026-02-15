@@ -20,7 +20,7 @@ use embassy_rp::uart::{Async, UartTx};
 use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::Duration;
+use embassy_time::{Duration, with_timeout};
 use embedded_io_async::Write;
 use fixed::types::extra::U8;
 use static_cell::StaticCell;
@@ -181,6 +181,11 @@ async fn main(spawner: Spawner) {
     let mut buf = [0; 1];
 
     loop {
+        // reset signals
+        SIGNAL.reset();
+        INPUT.reset();
+        ECHO.reset();
+
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(120)));
 
@@ -193,11 +198,6 @@ async fn main(spawner: Spawner) {
 
         info!("Received connection from {:?}", socket.remote_endpoint());
         control.gpio_set(0, true).await;
-
-        // reset signals
-        SIGNAL.reset();
-        INPUT.reset();
-        ECHO.reset();
 
         loop {
             let _n = match socket.read(&mut buf).await {
@@ -217,19 +217,23 @@ async fn main(spawner: Spawner) {
             // push the received byte it into INPUT
             INPUT.signal(buf[0]);
 
-            // wait for ECHO
-            let echo = ECHO.wait().await;
-
-            info!("echo: {:02x}", echo);
-
-            match socket.write_all(&[echo]).await {
-                Ok(()) => {
-                    // can accept a new byte from input
-                }
-                Err(e) => {
-                    warn!("write error: {:?}", e);
-                    break;
-                }
+            // wait for ECHO upt to 2 sec
+            if let Ok(echo) = with_timeout(Duration::from_secs(2), ECHO.wait()).await {
+                info!("echo: {:02x}", echo);
+                match socket.write_all(&[echo]).await {
+                    Ok(()) => {
+                        // can accept a new byte from input
+                    }
+                    Err(e) => {
+                        warn!("write error: {:?}", e);
+                        break;
+                    }
+                };
+            } else {
+                warn!("echo has not arrived, reconnecting...");
+                socket.abort();
+                let _ = socket.flush().await;
+                break;
             };
         }
     }
