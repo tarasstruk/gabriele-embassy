@@ -39,8 +39,11 @@ pub async fn uart_tx_task(mut tx: UartTx<'static, Async>) -> ! {
     loop {
         UART_READY.signal(());
         let byte = INPUT.wait().await;
-        let _ = tx.write(&[byte]).await;
+        info!("INPUT: {:02x}", byte);
+        let res = tx.write(&[byte]).await;
+        info!("WRITTEN: {:02x} WITH RESULT {:?}", byte, res);
         let _ = SIGNAL.wait().await;
+        info!("SIGNAL RECV FOR: {:02x}", byte);
         ECHO.signal(byte);
         info!("byte is forwarded");
     }

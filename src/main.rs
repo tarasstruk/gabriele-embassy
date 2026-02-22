@@ -164,9 +164,9 @@ async fn main(spawner: Spawner) {
 
     loop {
         // reset signals
-        SIGNAL.reset();
-        INPUT.reset();
-        ECHO.reset();
+        // SIGNAL.reset();
+        // INPUT.reset();
+        // ECHO.reset();
 
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(120)));
