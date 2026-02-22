@@ -2,14 +2,18 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
+mod setup_pio_1;
+mod tasks;
+
 // use core::str::from_utf8;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1};
-use embassy_rp::pio::program::pio_asm;
-use embassy_rp::pio::{Common, Config as PioConf, Pio, ShiftConfig, ShiftDirection, StateMachine};
+use embassy_rp::peripherals::{PIO0, PIO1};
+use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
+use crate::setup_pio_1::setup_pio_task_sm0;
+use crate::tasks::{cyw43_task, net_task, pio_task_sm0, uart_tx_task};
 use cyw43::JoinOptions;
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_net::StackResources;
@@ -20,9 +24,8 @@ use embassy_rp::uart::{Async, UartTx};
 use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write;
-use fixed::types::extra::U8;
 use static_cell::StaticCell;
 
 #[defmt::panic_handler]
@@ -31,59 +34,17 @@ fn panic() -> ! {
 }
 
 static SIGNAL: Signal<ThreadModeRawMutex, ()> = Signal::new();
+static UART_READY: Signal<ThreadModeRawMutex, ()> = Signal::new();
 static INPUT: Signal<ThreadModeRawMutex, u8> = Signal::new();
 static ECHO: Signal<ThreadModeRawMutex, u8> = Signal::new();
+
+static START_SEQ: [u8; 4] = [0xA1, 0x00, 0xA2, 0x00];
+static STOP_SEQ: [u8; 4] = [0xA3, 0x00, 0xA0, 0x00];
 
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
 });
-
-#[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
-    runner.run().await
-}
-
-fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, PIO1, 0>) {
-    let prg = pio_asm!(
-        ".wrap_target"
-        "  wait 0 pin 4"
-        "  wait 1 pin 4"
-        "  wait 0 pin 3"
-        "  wait 1 pin 3"
-        "  wait 0 pin 3"
-        "  in null, 1",
-        ".wrap"
-    );
-    let mut cfg = PioConf::default();
-    cfg.use_program(&pio.load_program(&prg.program), &[]);
-
-    cfg.shift_in = ShiftConfig {
-        auto_fill: true,
-        direction: ShiftDirection::Left,
-        threshold: 1,
-    };
-
-    cfg.clock_divider = fixed::FixedU32::<U8>::from_num(10);
-    sm.set_config(&cfg);
-    sm.set_enable(true);
-}
-
-// signals when the "confirmation pulse" from typewriter is received
-#[embassy_executor::task]
-async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
-    loop {
-        let _ = sm.rx().wait_pull().await;
-        SIGNAL.signal(());
-    }
-}
-
-#[embassy_executor::task]
-async fn cyw43_task(
-    runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>,
-) -> ! {
-    runner.run().await
-}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -180,6 +141,27 @@ async fn main(spawner: Spawner) {
     let mut tx_buffer = [0; 1];
     let mut buf = [0; 1];
 
+    let _ = UART_READY.wait().await;
+    info!("UART is ready...");
+
+    Timer::after(Duration::from_secs(5)).await;
+    transmit_bytes(&START_SEQ).await;
+
+    Timer::after(Duration::from_secs(5)).await;
+    transmit_bytes(&STOP_SEQ).await;
+
+    Timer::after(Duration::from_secs(2)).await;
+
+    info!("SECOND ROUND...");
+
+    Timer::after(Duration::from_secs(5)).await;
+    transmit_bytes(&START_SEQ).await;
+
+    Timer::after(Duration::from_secs(5)).await;
+    transmit_bytes(&STOP_SEQ).await;
+
+    Timer::after(Duration::from_secs(2)).await;
+
     loop {
         // reset signals
         SIGNAL.reset();
@@ -239,23 +221,14 @@ async fn main(spawner: Spawner) {
     }
 }
 
-#[embassy_executor::task]
-async fn uart_tx_task(tx: UartTx<'static, Async>) -> ! {
-    let uart_future = uart_writer_task(tx);
-    uart_future.await;
-}
-
-// these steps are done:
-// - receive a byte from INPUT
-// - transmit the byte to UART
-// - wait for SIGNAL
-// - produce ECHO
-async fn uart_writer_task<'d>(mut uart_tx: UartTx<'d, Async>) -> ! {
-    loop {
-        let byte = INPUT.wait().await;
-        let _ = uart_tx.write(&[byte]).await;
-        let _ = SIGNAL.wait().await;
-        ECHO.signal(byte);
-        info!("byte is forwarded");
+async fn transmit_bytes(seq: &[u8]) {
+    for (i, b) in seq.iter().enumerate() {
+        info!("sending byte {:02x} number {}", b, i);
+        INPUT.signal(*b);
+        let echo = ECHO.wait().await;
+        info!("echo {:02x} received", echo);
+        let delay = if (i + 1).is_multiple_of(2) { 50 } else { 20 };
+        info!("delay {}", delay);
+        Timer::after(Duration::from_millis(delay)).await;
     }
 }
