@@ -144,30 +144,7 @@ async fn main(spawner: Spawner) {
     let _ = UART_READY.wait().await;
     info!("UART is ready...");
 
-    Timer::after(Duration::from_secs(5)).await;
-    transmit_bytes(&START_SEQ).await;
-
-    Timer::after(Duration::from_secs(5)).await;
-    transmit_bytes(&STOP_SEQ).await;
-
-    Timer::after(Duration::from_secs(2)).await;
-
-    info!("SECOND ROUND...");
-
-    Timer::after(Duration::from_secs(5)).await;
-    transmit_bytes(&START_SEQ).await;
-
-    Timer::after(Duration::from_secs(5)).await;
-    transmit_bytes(&STOP_SEQ).await;
-
-    Timer::after(Duration::from_secs(2)).await;
-
     loop {
-        // reset signals
-        // SIGNAL.reset();
-        // INPUT.reset();
-        // ECHO.reset();
-
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(120)));
 
@@ -180,6 +157,10 @@ async fn main(spawner: Spawner) {
 
         info!("Received connection from {:?}", socket.remote_endpoint());
         control.gpio_set(0, true).await;
+
+        transmit_bytes(&START_SEQ).await;
+        // Timer::after(Duration::from_millis(500)).await;
+        info!("Machine is ready...");
 
         loop {
             let _n = match socket.read(&mut buf).await {
@@ -217,7 +198,11 @@ async fn main(spawner: Spawner) {
                 let _ = socket.flush().await;
                 break;
             };
-        }
+        } // end inner loop
+
+        Timer::after(Duration::from_millis(500)).await;
+        transmit_bytes(&STOP_SEQ).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
