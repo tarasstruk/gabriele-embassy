@@ -56,6 +56,8 @@ async fn main(spawner: Spawner) {
     uart_config.baudrate = 4800;
     let uart_tx: UartTx<'_, Async> = UartTx::new(p.UART1, p.PIN_4, p.DMA_CH1, uart_config);
 
+    let mut rts_pin = Output::new(p.PIN_7, Level::High);
+
     // PIO machinery
     let Pio {
         mut common,
@@ -148,6 +150,8 @@ async fn main(spawner: Spawner) {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(120)));
 
+        // release RTS pin (pull up)
+        rts_pin.set_high();
         control.gpio_set(0, false).await;
         info!("Listening on TCP:1234...");
         if let Err(e) = socket.accept(1234).await {
@@ -156,6 +160,11 @@ async fn main(spawner: Spawner) {
         }
 
         info!("Received connection from {:?}", socket.remote_endpoint());
+
+        // set RTS pin (pull down)
+        rts_pin.set_low();
+        Timer::after(Duration::from_millis(50)).await;
+
         control.gpio_set(0, true).await;
 
         transmit_bytes(&START_SEQ).await;
