@@ -8,7 +8,7 @@ mod tasks;
 // use core::str::from_utf8;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_rp::peripherals::{PIO0, PIO1};
+use embassy_rp::peripherals::{PIO0, PIO1, UART1};
 use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -20,7 +20,7 @@ use embassy_net::StackResources;
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::uart::{Async, UartTx};
+use embassy_rp::uart::{Async, InterruptHandler as UARTInterruptHandler, Uart, UartRx};
 use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
@@ -44,6 +44,7 @@ static STOP_SEQ: [u8; 4] = [0xA3, 0x00, 0xA0, 0x00];
 bind_interrupts!(struct Irqs {
     PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    UART1_IRQ  => UARTInterruptHandler<UART1>;
 });
 
 #[embassy_executor::main]
@@ -54,7 +55,17 @@ async fn main(spawner: Spawner) {
     // Create UART writer
     let mut uart_config = uart::Config::default();
     uart_config.baudrate = 4800;
-    let uart_tx: UartTx<'_, Async> = UartTx::new(p.UART1, p.PIN_4, p.DMA_CH1, uart_config);
+    let uart: Uart<'_, Async> = Uart::new(
+        p.UART1,
+        p.PIN_4,
+        p.PIN_5,
+        Irqs,
+        p.DMA_CH1,
+        p.DMA_CH2,
+        uart_config,
+    );
+
+    let (uart_tx, mut uart_rx) = uart.split();
 
     let mut rts_pin = Output::new(p.PIN_7, Level::High);
 
@@ -168,6 +179,8 @@ async fn main(spawner: Spawner) {
         control.gpio_set(0, true).await;
 
         transmit_bytes(&START_SEQ).await;
+        let _ = check_feedback(&mut uart_rx, [0xA1, 0xA2]).await;
+
         // Timer::after(Duration::from_millis(500)).await;
         info!("Machine is ready...");
 
@@ -211,6 +224,8 @@ async fn main(spawner: Spawner) {
 
         Timer::after(Duration::from_millis(500)).await;
         transmit_bytes(&STOP_SEQ).await;
+        let _ = check_feedback(&mut uart_rx, [0xA3, 0xA0]).await;
+
         Timer::after(Duration::from_millis(500)).await;
     }
 }
@@ -224,5 +239,26 @@ async fn transmit_bytes(seq: &[u8]) {
         let delay = if (i + 1).is_multiple_of(2) { 50 } else { 20 };
         info!("delay {}", delay);
         Timer::after(Duration::from_millis(delay)).await;
+    }
+}
+
+pub async fn check_feedback(rx: &mut UartRx<'static, Async>, pattern: [u8; 2]) -> Result<(), ()> {
+    let mut buf = [0; 2];
+    match rx.read(&mut buf).await {
+        Ok(_) if buf == pattern => {
+            warn!("Machine responded: {:02x}", buf);
+            Ok(())
+        }
+        Ok(_) => {
+            error!(
+                "Received unexpected data: {:02x}. Expected pattern: {:02x}.",
+                buf, pattern
+            );
+            Err(())
+        }
+        Err(e) => {
+            error!("UART read failure: {:?}", e);
+            Err(())
+        }
     }
 }
