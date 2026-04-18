@@ -26,6 +26,9 @@ use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write;
+use gabriele::machine::{InstructionSender, Machine};
+use gabriele::printing::Instruction;
+use gabriele::symbol::Symbol;
 use static_cell::StaticCell;
 
 #[defmt::panic_handler]
@@ -46,6 +49,22 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     UART1_IRQ  => UARTInterruptHandler<UART1>;
 });
+
+struct BytesSender;
+
+impl InstructionSender for BytesSender {
+    #[allow(clippy::manual_async_fn)]
+    fn send(&self, instr: Instruction) -> impl Future<Output = ()> + '_ {
+        async move {
+            match instr {
+                Instruction::SendBytes(word) => {
+                    transmit_bytes(&word.to_be_bytes()).await;
+                }
+                Instruction::Halt => {}
+            }
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -157,6 +176,9 @@ async fn main(spawner: Spawner) {
     let _ = UART_READY.wait().await;
     info!("UART is ready...");
 
+    let mut machine = Machine::new(BytesSender);
+    let db: &'static [Symbol] = &gabriele::wheels::standard::SYMBOLS;
+
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(120)));
@@ -181,8 +203,9 @@ async fn main(spawner: Spawner) {
         transmit_bytes(&START_SEQ).await;
         let _ = check_feedback(&mut uart_rx, [0xA1, 0xA2]).await;
 
-        // Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(100)).await;
         info!("Machine is ready...");
+        machine.print("Hallo Gabriele\n...\n", db).await;
 
         loop {
             let _n = match socket.read(&mut buf).await {

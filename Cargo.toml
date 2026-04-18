@@ -30,4 +30,4 @@ embassy-net = { version = "0.8.0", features = ["defmt", "dhcpv4", "tcp"] }
 portable-atomic = { version = "1", features = ["critical-section"] }
 # panic-halt = "1.0.0"
 # rp2040-boot2 = "0.3.0"
-
+gabriele = { path = "../gabriele/gabriele" }
