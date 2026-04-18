@@ -53,15 +53,12 @@ bind_interrupts!(struct Irqs {
 struct BytesSender;
 
 impl InstructionSender for BytesSender {
-    #[allow(clippy::manual_async_fn)]
-    fn send(&self, instr: Instruction) -> impl Future<Output = ()> + '_ {
-        async move {
-            match instr {
-                Instruction::SendBytes(word) => {
-                    transmit_bytes(&word.to_be_bytes()).await;
-                }
-                Instruction::Halt => {}
+    async fn send(&self, instr: Instruction) {
+        match instr {
+            Instruction::SendBytes(word) => {
+                transmit_bytes(&word.to_be_bytes()).await;
             }
+            Instruction::Halt => {}
         }
     }
 }
