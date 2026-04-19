@@ -26,3 +26,4 @@ static_cell = "2.1.1"
 embassy-net = { version = "0.9.1", features = ["defmt", "dhcpv4", "tcp"] }
 portable-atomic = { version = "1", features = ["critical-section"] }
 gabriele = { path = "../gabriele/gabriele" }
+heapless = "0.9.2"

@@ -29,6 +29,7 @@ use embedded_io_async::Write;
 use gabriele::machine::{InstructionSender, Machine};
 use gabriele::printing::Instruction;
 use gabriele::symbol::Symbol;
+use heapless::String;
 use static_cell::StaticCell;
 
 #[defmt::panic_handler]
@@ -160,6 +161,8 @@ async fn main(spawner: Spawner) {
     // And now we can use it!
     info!("Stack is up!");
 
+    let connection_cfg = stack.config_v4();
+
     // Start PIO
     let _ = spawner.spawn(pio_task_sm0(sm0));
 
@@ -202,7 +205,14 @@ async fn main(spawner: Spawner) {
 
         Timer::after(Duration::from_millis(100)).await;
         info!("Machine is ready...");
-        machine.print("Hallo Gabriele\n...\n", db).await;
+        machine.print("Hallo Gabriele\n", db).await;
+
+        if let Some(cfg) = connection_cfg.clone() {
+            let ip = cfg.address.address();
+            let mut buf: String<20> = String::new();
+            core::fmt::Write::write_fmt(&mut buf, format_args!("{}\n", ip)).unwrap();
+            machine.print(buf.as_str(), db).await;
+        }
 
         loop {
             let _n = match socket.read(&mut buf).await {
