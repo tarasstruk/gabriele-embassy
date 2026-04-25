@@ -2,190 +2,285 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use embassy_executor::Spawner;
-use embassy_futures::join::{join, join4};
-use embassy_rp::peripherals::{PIO0, PIO1, USB};
-use embassy_rp::pio::program::pio_asm;
-use embassy_rp::pio::{Common, Config as PioConf, ShiftConfig, ShiftDirection, StateMachine};
+mod feedback;
+mod setup_pio_1;
+mod tasks;
 
-use embassy_rp::pio_programs::uart::{PioUartRx, PioUartRxProgram, PioUartTx, PioUartTxProgram};
-use embassy_rp::usb::{Driver, Instance, InterruptHandler};
-use embassy_rp::{bind_interrupts, pio};
+use defmt::*;
+use embassy_executor::Spawner;
+use embassy_rp::peripherals::{PIO0, PIO1, UART1};
+use embassy_rp::pio::Pio;
+use {defmt_rtt as _, panic_probe as _};
+
+use crate::feedback::{MachineFeedback, check_feedback};
+use crate::setup_pio_1::setup_pio_task_sm0;
+use crate::tasks::{cyw43_task, net_task, pio_task_sm0, uart_tx_task};
+use cyw43::JoinOptions;
+use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
+use embassy_net::StackResources;
+use embassy_net::tcp::TcpSocket;
+use embassy_rp::clocks::RoscRng;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::uart::{Async, InterruptHandler as UARTInterruptHandler, Uart};
+use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
-use embassy_usb::driver::EndpointError;
-use embassy_usb::{Builder, Config};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write;
-use fixed::types::extra::U8;
+use gabriele::machine::{InstructionSender, Machine};
+use gabriele::printing::Instruction;
+use gabriele::symbol::Symbol;
+use heapless::String;
+use static_cell::StaticCell;
 
-#[unsafe(link_section = ".boot_loader")]
-#[used]
-pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-use panic_halt as _;
+#[defmt::panic_handler]
+fn panic() -> ! {
+    panic_probe::hard_fault();
+}
 
 static SIGNAL: Signal<ThreadModeRawMutex, ()> = Signal::new();
+static UART_READY: Signal<ThreadModeRawMutex, ()> = Signal::new();
 static INPUT: Signal<ThreadModeRawMutex, u8> = Signal::new();
 static ECHO: Signal<ThreadModeRawMutex, u8> = Signal::new();
 
+static START_SEQ: [u8; 4] = [0xA1, 0x00, 0xA2, 0x00];
+static STOP_SEQ: [u8; 4] = [0xA3, 0x00, 0xA0, 0x00];
+
 bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => InterruptHandler<USB>;
-    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
-    PIO1_IRQ_0 => pio::InterruptHandler<PIO1>;
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO1>;
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
+    UART1_IRQ  => UARTInterruptHandler<UART1>;
 });
 
-fn setup_pio_task_sm0<'d>(pio: &mut Common<'d, PIO1>, sm: &mut StateMachine<'d, PIO1, 0>) {
-    let prg = pio_asm!(
-        ".wrap_target"
-        "  wait 0 pin 0"
-        "  wait 1 pin 0"
-        "  wait 0 pin 3"
-        "  wait 1 pin 3"
-        "  wait 0 pin 3"
-        "  in null, 1",
-        ".wrap"
-    );
-    let mut cfg = PioConf::default();
-    cfg.use_program(&pio.load_program(&prg.program), &[]);
+struct BytesSender;
 
-    cfg.shift_in = ShiftConfig {
-        auto_fill: true,
-        direction: ShiftDirection::Left,
-        threshold: 1,
-    };
-
-    cfg.clock_divider = fixed::FixedU32::<U8>::from_num(10);
-    sm.set_config(&cfg);
-    sm.set_enable(true);
-}
-
-async fn pio_task_sm0(mut sm: StateMachine<'static, PIO1, 0>) -> ! {
-    loop {
-        let _ = sm.rx().wait_pull().await;
-        SIGNAL.signal(());
+impl InstructionSender for BytesSender {
+    async fn send(&self, instr: Instruction) {
+        match instr {
+            Instruction::SendBytes(word) => {
+                transmit_bytes(&word.to_be_bytes()).await;
+            }
+            Instruction::Halt => {}
+        }
     }
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+async fn main(spawner: Spawner) {
+    info!("spawner started");
+    let p = embassy_rp::init(embassy_rp::config::Config::default());
 
-    // Create the driver, from the HAL.
-    let driver = Driver::new(p.USB, Irqs);
-
-    // Create embassy-usb Config
-    let mut config = Config::new(0xc0de, 0xcafe);
-    config.manufacturer = Some("Embassy");
-    config.product = Some("PIO UART example");
-    config.serial_number = Some("12345678");
-    config.max_power = 100;
-    config.max_packet_size_0 = 64;
-
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 64];
-
-    let mut state = State::new();
-
-    let mut builder = Builder::new(
-        driver,
-        config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
-        &mut [], // no msos descriptors
-        &mut control_buf,
+    // Create UART writer
+    let mut uart_config = uart::Config::default();
+    uart_config.baudrate = 4800;
+    let uart: Uart<'_, Async> = Uart::new(
+        p.UART1,
+        p.PIN_4,
+        p.PIN_5,
+        Irqs,
+        p.DMA_CH1,
+        p.DMA_CH2,
+        uart_config,
     );
 
-    // Create classes on the builder.
-    let class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    let (uart_tx, mut uart_rx) = uart.split();
 
-    // Build the builder.
-    let mut usb = builder.build();
+    let mut rts_pin = Output::new(p.PIN_7, Level::High);
 
-    // Run the USB device.
-    let usb_fut = usb.run();
-
-    // PIO UART setup
-    let pio::Pio {
-        mut common,
-        sm0,
-        sm1,
-        ..
-    } = pio::Pio::new(p.PIO0, Irqs);
-
-    let tx_program = PioUartTxProgram::new(&mut common);
-    let mut uart_tx = PioUartTx::new(4800, &mut common, sm0, p.PIN_0, &tx_program);
-
-    let rx_program = PioUartRxProgram::new(&mut common);
-    let mut uart_rx = PioUartRx::new(4800, &mut common, sm1, p.PIN_1, &rx_program);
-
-    let pio::Pio {
+    // PIO machinery
+    let Pio {
         mut common,
         mut sm0,
-        // sm1,
         ..
-    } = pio::Pio::new(p.PIO1, Irqs);
+    } = Pio::new(p.PIO1, Irqs);
 
     setup_pio_task_sm0(&mut common, &mut sm0);
 
-    let (mut usb_tx, mut usb_rx) = class.split();
+    // WiFi
 
-    // Read + write from USB
-    let usb_future = async {
-        loop {
-            usb_rx.wait_connection().await;
-            let _ = join(usb_read(&mut usb_rx), usb_write(&mut usb_tx)).await;
-        }
-    };
+    let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    // let nvram = include_bytes!("../cyw43-firmware/nvram_rp2040.bin");
 
-    // Read + write from UART
-    let uart_future = uart_write(&mut uart_tx);
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        p.DMA_CH0,
+    );
 
-    // Run everything concurrently.
-    join4(usb_fut, usb_future, uart_future, pio_task_sm0(sm0)).await;
-}
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
 
-struct Disconnected {}
+    // let _ = spawner.spawn(unwrap!(cyw43_task(runner)));
 
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
-            EndpointError::Disabled => Disconnected {},
-        }
+    let _ = spawner.spawn(cyw43_task(runner));
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    // Generate random seed
+    let mut rng = RoscRng;
+    let seed = rng.next_u64();
+
+    // Init network stack
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+
+    let _ = spawner.spawn(net_task(runner));
+
+    let wifi_net: &str = str::from_utf8(include_bytes!("../wifi_net")).unwrap();
+    let wifi_pass = include_bytes!("../wifi_pass");
+
+    while let Err(_err) = control.join(wifi_net, JoinOptions::new(wifi_pass)).await {
+        info!("join wifi network failed");
     }
-}
 
-async fn usb_read<'d, T: Instance + 'd>(
-    usb_rx: &mut Receiver<'d, Driver<'d, T>>,
-) -> Result<(), Disconnected> {
+    info!("waiting for link...");
+    stack.wait_link_up().await;
+
+    info!("waiting for DHCP...");
+    stack.wait_config_up().await;
+
+    // And now we can use it!
+    info!("Stack is up!");
+
+    let connection_cfg = stack.config_v4();
+
+    // Start PIO
+    let _ = spawner.spawn(pio_task_sm0(sm0));
+
+    // Start UART
+    let _ = spawner.spawn(uart_tx_task(uart_tx));
+
+    let mut rx_buffer = [0; 1];
+    let mut tx_buffer = [0; 1];
     let mut buf = [0; 1];
+
+    let _ = UART_READY.wait().await;
+    info!("UART is ready...");
+
+    let db: &'static [Symbol] = &gabriele::wheels::standard::SYMBOLS;
+    let mut machine = Machine::new(BytesSender, db);
+
     loop {
-        let _n = usb_rx.read_packet(&mut buf).await?;
-        let byte = buf[0];
-        INPUT.signal(byte);
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(120)));
+
+        // release RTS pin (pull up)
+        rts_pin.set_high();
+        control.gpio_set(0, false).await;
+        info!("Listening on TCP:1234...");
+        if let Err(e) = socket.accept(1234).await {
+            warn!("accept error: {:?}", e);
+            continue;
+        }
+
+        info!("Received connection from {:?}", socket.remote_endpoint());
+
+        // set RTS pin (pull down)
+        rts_pin.set_low();
+        Timer::after(Duration::from_millis(50)).await;
+
+        control.gpio_set(0, true).await;
+
+        transmit_bytes(&START_SEQ).await;
+
+        if let Ok(MachineFeedback::Started) = check_feedback(&mut uart_rx).await {
+            info!("Machine acknowledged start sequence");
+        } else {
+            error!("Machine did not acknowledge start sequence, reconnecting...");
+            socket.abort();
+            continue;
+        };
+
+        Timer::after(Duration::from_millis(100)).await;
+        info!("Machine is ready...");
+        machine.print("Hallo Gabriele\n").await;
+
+        if let Some(cfg) = connection_cfg.clone() {
+            let ip = cfg.address.address();
+            let mut buf: String<20> = String::new();
+            core::fmt::Write::write_fmt(&mut buf, format_args!("{}\n", ip)).unwrap();
+            machine.print(buf.as_str()).await;
+        }
+
+        loop {
+            let _n = match socket.read(&mut buf).await {
+                Ok(0) => {
+                    warn!("read EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("read error: {:?}", e);
+                    break;
+                }
+            };
+
+            info!("recv: {:02x}", buf[0]);
+
+            // push the received byte it into INPUT
+            INPUT.signal(buf[0]);
+
+            // wait for ECHO upt to 2 sec
+            if let Ok(echo) = with_timeout(Duration::from_secs(2), ECHO.wait()).await {
+                info!("echo: {:02x}", echo);
+                match socket.write_all(&[echo]).await {
+                    Ok(()) => {
+                        // can accept a new byte from input
+                    }
+                    Err(e) => {
+                        warn!("write error: {:?}", e);
+                        break;
+                    }
+                };
+            } else {
+                warn!("echo has not arrived, reconnecting...");
+                socket.abort();
+                let _ = socket.flush().await;
+                break;
+            };
+        } // end inner loop
+
+        Timer::after(Duration::from_millis(500)).await;
+        transmit_bytes(&STOP_SEQ).await;
+
+        if let Ok(MachineFeedback::Stopped) = check_feedback(&mut uart_rx).await {
+            info!("Machine acknowledged stop sequence");
+        } else {
+            error!("Machine did not acknowledge the stop sequence, reconnecting...");
+        };
+
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
-async fn usb_write<'d, t: Instance + 'd>(
-    usb_tx: &mut Sender<'d, Driver<'d, t>>,
-) -> Result<(), Disconnected> {
-    loop {
-        let byte = ECHO.wait().await;
-        usb_tx.write_packet(&[byte]).await?;
-    }
-}
-
-async fn uart_write<PIO: pio::Instance, const SM: usize>(
-    uart_tx: &mut PioUartTx<'_, PIO, SM>,
-) -> ! {
-    loop {
-        let byte = INPUT.wait().await;
-        let _ = uart_tx.write(&[byte]).await;
-        let _ = SIGNAL.wait().await;
-        ECHO.signal(byte);
+async fn transmit_bytes(seq: &[u8]) {
+    for (i, b) in seq.iter().enumerate() {
+        info!("sending byte {:02x} number {}", b, i);
+        INPUT.signal(*b);
+        let echo = ECHO.wait().await;
+        info!("echo {:02x} received", echo);
+        let delay = if (i + 1).is_multiple_of(2) { 50 } else { 20 };
+        info!("delay {}", delay);
+        Timer::after(Duration::from_millis(delay)).await;
     }
 }
