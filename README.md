@@ -24,6 +24,8 @@ Each byte is flow-controlled one at a time — the firmware will not send the ne
 
 ## Wiring
 
+<img src="pinout.jpg" alt="Gabriele 9009 UART Connector pinout" width="400">
+
 | Pico W Pin | Function                        |
 |------------|---------------------------------|
 | GP4        | UART1 TX (to typewriter)        |
