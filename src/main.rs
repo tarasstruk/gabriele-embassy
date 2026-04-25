@@ -177,8 +177,8 @@ async fn main(spawner: Spawner) {
     let _ = UART_READY.wait().await;
     info!("UART is ready...");
 
-    let mut machine = Machine::new(BytesSender);
     let db: &'static [Symbol] = &gabriele::wheels::standard::SYMBOLS;
+    let mut machine = Machine::new(BytesSender, db);
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -213,13 +213,13 @@ async fn main(spawner: Spawner) {
 
         Timer::after(Duration::from_millis(100)).await;
         info!("Machine is ready...");
-        machine.print("Hallo Gabriele\n", db).await;
+        machine.print("Hallo Gabriele\n").await;
 
         if let Some(cfg) = connection_cfg.clone() {
             let ip = cfg.address.address();
             let mut buf: String<20> = String::new();
             core::fmt::Write::write_fmt(&mut buf, format_args!("{}\n", ip)).unwrap();
-            machine.print(buf.as_str(), db).await;
+            machine.print(buf.as_str()).await;
         }
 
         loop {
