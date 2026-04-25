@@ -2,16 +2,17 @@
 #![no_main]
 #![allow(async_fn_in_trait)]
 
+mod feedback;
 mod setup_pio_1;
 mod tasks;
 
-// use core::str::from_utf8;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_rp::peripherals::{PIO0, PIO1, UART1};
 use embassy_rp::pio::Pio;
 use {defmt_rtt as _, panic_probe as _};
 
+use crate::feedback::{MachineFeedback, check_feedback};
 use crate::setup_pio_1::setup_pio_task_sm0;
 use crate::tasks::{cyw43_task, net_task, pio_task_sm0, uart_tx_task};
 use cyw43::JoinOptions;
@@ -20,7 +21,7 @@ use embassy_net::StackResources;
 use embassy_net::tcp::TcpSocket;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::uart::{Async, InterruptHandler as UARTInterruptHandler, Uart, UartRx};
+use embassy_rp::uart::{Async, InterruptHandler as UARTInterruptHandler, Uart};
 use embassy_rp::{bind_interrupts, uart};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
@@ -201,7 +202,14 @@ async fn main(spawner: Spawner) {
         control.gpio_set(0, true).await;
 
         transmit_bytes(&START_SEQ).await;
-        let _ = check_feedback(&mut uart_rx, [0xA1, 0xA2]).await;
+
+        if let Ok(MachineFeedback::Started) = check_feedback(&mut uart_rx).await {
+            info!("Machine acknowledged start sequence");
+        } else {
+            error!("Machine did not acknowledge start sequence, reconnecting...");
+            socket.abort();
+            continue;
+        };
 
         Timer::after(Duration::from_millis(100)).await;
         info!("Machine is ready...");
@@ -254,7 +262,12 @@ async fn main(spawner: Spawner) {
 
         Timer::after(Duration::from_millis(500)).await;
         transmit_bytes(&STOP_SEQ).await;
-        let _ = check_feedback(&mut uart_rx, [0xA3, 0xA0]).await;
+
+        if let Ok(MachineFeedback::Stopped) = check_feedback(&mut uart_rx).await {
+            info!("Machine acknowledged stop sequence");
+        } else {
+            error!("Machine did not acknowledge the stop sequence, reconnecting...");
+        };
 
         Timer::after(Duration::from_millis(500)).await;
     }
@@ -269,26 +282,5 @@ async fn transmit_bytes(seq: &[u8]) {
         let delay = if (i + 1).is_multiple_of(2) { 50 } else { 20 };
         info!("delay {}", delay);
         Timer::after(Duration::from_millis(delay)).await;
-    }
-}
-
-pub async fn check_feedback(rx: &mut UartRx<'static, Async>, pattern: [u8; 2]) -> Result<(), ()> {
-    let mut buf = [0; 2];
-    match rx.read(&mut buf).await {
-        Ok(_) if buf == pattern => {
-            warn!("Machine responded: {:02x}", buf);
-            Ok(())
-        }
-        Ok(_) => {
-            error!(
-                "Received unexpected data: {:02x}. Expected pattern: {:02x}.",
-                buf, pattern
-            );
-            Err(())
-        }
-        Err(e) => {
-            error!("UART read failure: {:?}", e);
-            Err(())
-        }
     }
 }
